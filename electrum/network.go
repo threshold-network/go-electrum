@@ -261,6 +261,7 @@ func (s *Client) listen() {
 func (s *Client) listenPush(method string) <-chan *container {
 	c := make(chan *container, 1)
 	s.pushHandlersLock.Lock()
+	fmt.Printf("listenPush: s.pushHandlers = %v\n", s.pushHandlers)
 	s.pushHandlers[method] = append(s.pushHandlers[method], c)
 	s.pushHandlersLock.Unlock()
 
@@ -341,6 +342,7 @@ func (s *Client) Shutdown() {
 	}
 	s.transport = nil
 	s.handlers = nil
+	fmt.Printf("Shutdown - setting s.handlers to nil\n")
 	s.pushHandlers = nil
 }
 
