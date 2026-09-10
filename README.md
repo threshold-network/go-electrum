@@ -58,6 +58,28 @@ func main() {
 }
 ```
 
+## Subscription lifetime
+
+Pass a cancelable context to `SubscribeHeaders`, `SubscribeMasternode`, or
+`SubscribeScripthashContext` and cancel it when you stop reading notifications.
+Their channels close on cancellation, client shutdown, or malformed notifications.
+Canceling a subscription also removes its local notification handler.
+
+`SubscribeScripthash()` remains available for existing callers. Call `Close()` on
+its returned subscription to stop it without shutting down the client. Use
+`SubscribeHeadersSingle` when only the current blockchain tip is needed.
+
+Closing or canceling a scripthash subscription also cancels its pending `Add`
+requests. Canceling an individual `Add` request leaves the subscription active.
+
+Header and masternode streams treat the initial response as a snapshot and
+discard notifications received before it. Later header notifications can
+move the tip to the same or a lower height during a reorganization.
+
+Cancellation stops local delivery; the Electrum protocol does not cancel the
+server's header subscription. Slow readers retain the existing bounded buffering
+behavior, so notifications may be dropped when a subscription's buffer is full.
+
 # License
 go-electrum is licensed under the MIT license. See LICENSE file for more details.
 

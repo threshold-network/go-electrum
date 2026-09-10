@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -13,6 +14,10 @@ type WebSocketTransport struct {
 	conn      *websocket.Conn
 	responses chan []byte
 	errors    chan error
+	writeLock sync.Mutex
+	closeOnce sync.Once
+	closeErr  error
+	quit      chan struct{}
 	// close is a channel used for graceful connection closure
 	close chan struct{}
 }
@@ -45,8 +50,9 @@ func NewWebSocketTransport(
 	ws := &WebSocketTransport{
 		conn:      conn,
 		responses: make(chan []byte),
-		errors:    make(chan error),
+		errors:    make(chan error, 1),
 		close:     make(chan struct{}),
+		quit:      make(chan struct{}),
 	}
 
 	go ws.listen()
@@ -55,8 +61,10 @@ func NewWebSocketTransport(
 }
 
 func (t *WebSocketTransport) listen() {
-	defer t.conn.Close()
 	defer close(t.close)
+	defer t.conn.Close()
+	defer close(t.responses)
+	defer close(t.errors)
 
 	for {
 		_, msg, err := t.conn.ReadMessage()
@@ -72,18 +80,37 @@ func (t *WebSocketTransport) listen() {
 		if err != nil {
 			isNormalClose := websocket.IsCloseError(err, websocket.CloseNormalClosure)
 			if !isNormalClose {
-				t.errors <- err
+				select {
+				case t.errors <- err:
+				case <-t.quit:
+				}
 			}
 
 			break
 		}
 
-		t.responses <- msg
+		select {
+		case t.responses <- msg:
+		case <-t.quit:
+			return
+		}
 	}
 }
 
 // SendMessage sends a message to the remote server through the WebSocket transport.
 func (t *WebSocketTransport) SendMessage(body []byte) error {
+	// Gorilla permits only one data writer per connection.
+	t.writeLock.Lock()
+	defer t.writeLock.Unlock()
+
+	select {
+	case <-t.quit:
+		return ErrServerShutdown
+	case <-t.close:
+		return ErrServerShutdown
+	default:
+	}
+
 	if DebugMode {
 		log.Printf("%s [debug] %s <- %s", time.Now().Format("2006-01-02 15:04:05"), t.conn.RemoteAddr(), body)
 	}
@@ -103,18 +130,26 @@ func (t *WebSocketTransport) Errors() <-chan error {
 
 // Close closes WebSocket transport.
 func (t *WebSocketTransport) Close() error {
-	// Cleanly close the connection by sending a close message and then
-	// waiting (with timeout) for the server to close the connection.
-	err := t.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-	if err != nil {
-		log.Printf("%s [error] %s -> close error: %s", time.Now().Format("2006-01-02 15:04:05"), t.conn.RemoteAddr(), err)
-	}
+	t.closeOnce.Do(func() {
+		close(t.quit)
+		deadline := time.Now().Add(webSocketClosingTimeout)
+		// WriteControl is safe alongside WriteMessage. Its deadline also bounds
+		// waiting for an in-flight data write, so shutdown can unblock it.
+		err := t.conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+		if err != nil {
+			t.closeErr = t.conn.Close()
+			return
+		}
 
-	select {
-	case <-t.close:
-	case <-time.After(webSocketClosingTimeout):
-		return t.conn.Close()
-	}
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		select {
+		case <-t.close:
+		case <-timer.C:
+			t.closeErr = t.conn.Close()
+		}
+	})
 
-	return nil
+	return t.closeErr
 }
