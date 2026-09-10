@@ -25,16 +25,18 @@ type SubscribeHeadersResult struct {
 
 // SubscribeHeaders subscribes to receive block headers notifications when new blocks are found.
 //
-// BEWARE: This function can lead to a memory leak if the caller stops
-// pulling from the returned channel. See the SubscribeHeadersSingle method
-// for a safer alternative.
+// Cancel ctx when no longer reading notifications. The returned channel closes
+// when ctx is canceled, the client shuts down, or a notification is invalid.
+// Use SubscribeHeadersSingle when only the current tip is needed.
 //
 // https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-headers-subscribe
 func (s *Client) SubscribeHeaders(ctx context.Context) (<-chan *SubscribeHeadersResult, error) {
+	notifications, unsubscribe := s.listenPush("blockchain.headers.subscribe")
 	var resp SubscribeHeadersResp
 
 	err := s.request(ctx, "blockchain.headers.subscribe", []interface{}{}, &resp)
 	if err != nil {
+		unsubscribe()
 		return nil, err
 	}
 
@@ -42,20 +44,31 @@ func (s *Client) SubscribeHeaders(ctx context.Context) (<-chan *SubscribeHeaders
 	respChan <- resp.Result
 
 	go func() {
-		for msg := range s.listenPush("blockchain.headers.subscribe") {
-			if msg.err != nil {
+		defer close(respChan)
+		defer unsubscribe()
+		for {
+			select {
+			case <-ctx.Done():
 				return
-			}
-
-			var resp SubscribeHeadersNotif
-
-			err := json.Unmarshal(msg.content, &resp)
-			if err != nil {
+			case <-s.quit:
 				return
-			}
-
-			for _, param := range resp.Params {
-				respChan <- param
+			case msg, ok := <-notifications:
+				if !ok || msg.err != nil {
+					return
+				}
+				var resp SubscribeHeadersNotif
+				if err := json.Unmarshal(msg.content, &resp); err != nil {
+					return
+				}
+				for _, param := range resp.Params {
+					select {
+					case respChan <- param:
+					case <-ctx.Done():
+						return
+					case <-s.quit:
+						return
+					}
+				}
 			}
 		}
 	}()
@@ -70,9 +83,8 @@ func (s *Client) SubscribeHeaders(ctx context.Context) (<-chan *SubscribeHeaders
 // Worth noting that this action still creates a new subscription in the Electrum
 // server. The protocol does neither support a single-shot request for the
 // current blockchain tip nor subscription cancellation. Although this limitation
-// causes a slight resource overhead on the client, it does not cause a memory
-// leak like the SubscribeHeaders method which spawns a goroutine that may hang
-// on the channel if the caller is no longer pulling from it.
+// causes a slight resource overhead on the client, this method does not spawn
+// a goroutine or require the caller to manage a streaming subscription.
 //
 // https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-headers-subscribe
 func (s *Client) SubscribeHeadersSingle(ctx context.Context) (
@@ -102,7 +114,11 @@ type ScripthashSubscription struct {
 	subscribedSH  []string
 	scripthashMap map[string]string
 
-	lock sync.RWMutex
+	lock       sync.RWMutex
+	ctx        context.Context
+	cancel     context.CancelFunc
+	notifyLock sync.RWMutex
+	closed     bool
 }
 
 // SubscribeNotif represent the notification to SubscribeScripthash() and SubscribeMasternode().
@@ -110,52 +126,106 @@ type SubscribeNotif struct {
 	Params [2]string `json:"params"`
 }
 
-// SubscribeScripthash ...
+// SubscribeScripthash receives scripthash notifications until Close or client
+// shutdown. Use SubscribeScripthashContext to tie the subscription to a context.
 func (s *Client) SubscribeScripthash() (*ScripthashSubscription, <-chan *SubscribeNotif) {
+	return s.SubscribeScripthashContext(context.Background())
+}
+
+// SubscribeScripthashContext receives scripthash notifications until ctx is
+// canceled, Close is called, or the client shuts down. Cancel or close the
+// subscription when no longer reading its channel.
+func (s *Client) SubscribeScripthashContext(ctx context.Context) (*ScripthashSubscription, <-chan *SubscribeNotif) {
+	ctx, cancel := context.WithCancel(ctx)
 	sub := &ScripthashSubscription{
 		server:        s,
 		notifChan:     make(chan *SubscribeNotif, 1),
 		scripthashMap: make(map[string]string),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
+	notifications, unsubscribe := s.listenPush("blockchain.scripthash.subscribe")
 
 	go func() {
-		for msg := range s.listenPush("blockchain.scripthash.subscribe") {
-			if msg.err != nil {
+		defer func() {
+			cancel()
+			unsubscribe()
+			// Add can also send initial notifications. Wake blocked senders before
+			// taking the exclusive lock and closing their destination channel.
+			sub.notifyLock.Lock()
+			sub.closed = true
+			close(sub.notifChan)
+			sub.notifyLock.Unlock()
+		}()
+		for {
+			select {
+			case <-ctx.Done():
 				return
-			}
-
-			var resp SubscribeNotif
-
-			err := json.Unmarshal(msg.content, &resp)
-			if err != nil {
+			case <-s.quit:
 				return
-			}
-
-			sub.lock.Lock()
-			for _, a := range sub.subscribedSH {
-				if a == resp.Params[0] {
-					sub.notifChan <- &resp
-					break
+			case msg, ok := <-notifications:
+				if !ok || msg.err != nil {
+					return
+				}
+				var resp SubscribeNotif
+				if err := json.Unmarshal(msg.content, &resp); err != nil {
+					return
+				}
+				sub.lock.RLock()
+				subscribed := false
+				for _, a := range sub.subscribedSH {
+					if a == resp.Params[0] {
+						subscribed = true
+						break
+					}
+				}
+				sub.lock.RUnlock()
+				if subscribed {
+					if err := sub.notify(ctx, &resp); err != nil {
+						return
+					}
 				}
 			}
-			sub.lock.Unlock()
 		}
 	}()
 
 	return sub, sub.notifChan
 }
 
+// Close stops this subscription and closes its notification channel once
+// in-flight sends have exited. It is safe to call more than once.
+func (sub *ScripthashSubscription) Close() {
+	sub.cancel()
+}
+
+func (sub *ScripthashSubscription) notify(ctx context.Context, notification *SubscribeNotif) error {
+	sub.notifyLock.RLock()
+	defer sub.notifyLock.RUnlock()
+	if sub.closed || sub.ctx.Err() != nil {
+		return context.Canceled
+	}
+	select {
+	case <-sub.ctx.Done():
+		return sub.ctx.Err()
+	case <-sub.server.quit:
+		return ErrServerShutdown
+	case <-ctx.Done():
+		return ErrTimeout
+	case sub.notifChan <- notification:
+		return nil
+	}
+}
+
 // Add ...
 func (sub *ScripthashSubscription) Add(ctx context.Context, scripthash string, address ...string) error {
+	if err := sub.ctx.Err(); err != nil {
+		return err
+	}
 	var resp basicResp
 
 	err := sub.server.request(ctx, "blockchain.scripthash.subscribe", []interface{}{scripthash}, &resp)
 	if err != nil {
 		return err
-	}
-
-	if len(resp.Result) > 0 {
-		sub.notifChan <- &SubscribeNotif{[2]string{scripthash, resp.Result}}
 	}
 
 	sub.lock.Lock()
@@ -165,11 +235,17 @@ func (sub *ScripthashSubscription) Add(ctx context.Context, scripthash string, a
 	}
 	sub.lock.Unlock()
 
+	if len(resp.Result) > 0 {
+		return sub.notify(ctx, &SubscribeNotif{[2]string{scripthash, resp.Result}})
+	}
+
 	return nil
 }
 
 // GetAddress ...
 func (sub *ScripthashSubscription) GetAddress(scripthash string) (string, error) {
+	sub.lock.RLock()
+	defer sub.lock.RUnlock()
 	address, ok := sub.scripthashMap[scripthash]
 	if ok {
 		return address, nil
@@ -180,6 +256,8 @@ func (sub *ScripthashSubscription) GetAddress(scripthash string) (string, error)
 
 // GetScripthash ...
 func (sub *ScripthashSubscription) GetScripthash(address string) (string, error) {
+	sub.lock.RLock()
+	defer sub.lock.RUnlock()
 	var found bool
 	var scripthash string
 
@@ -204,11 +282,11 @@ func (sub *ScripthashSubscription) GetChannel() <-chan *SubscribeNotif {
 
 // Remove ...
 func (sub *ScripthashSubscription) Remove(scripthash string) error {
+	sub.lock.Lock()
+	defer sub.lock.Unlock()
 	for i, v := range sub.subscribedSH {
 		if v == scripthash {
-			sub.lock.Lock()
 			sub.subscribedSH = append(sub.subscribedSH[:i], sub.subscribedSH[i+1:]...)
-			sub.lock.Unlock()
 			return nil
 		}
 	}
@@ -223,12 +301,12 @@ func (sub *ScripthashSubscription) RemoveAddress(address string) error {
 		return err
 	}
 
+	sub.lock.Lock()
+	defer sub.lock.Unlock()
 	for i, v := range sub.subscribedSH {
 		if v == scripthash {
-			sub.lock.Lock()
 			sub.subscribedSH = append(sub.subscribedSH[:i], sub.subscribedSH[i+1:]...)
 			delete(sub.scripthashMap, scripthash)
-			sub.lock.Unlock()
 			return nil
 		}
 	}
@@ -238,7 +316,10 @@ func (sub *ScripthashSubscription) RemoveAddress(address string) error {
 
 // Resubscribe ...
 func (sub *ScripthashSubscription) Resubscribe(ctx context.Context) error {
-	for _, v := range sub.subscribedSH {
+	sub.lock.RLock()
+	scripthashes := append([]string(nil), sub.subscribedSH...)
+	sub.lock.RUnlock()
+	for _, v := range scripthashes {
 		err := sub.Add(ctx, v)
 		if err != nil {
 			return err
@@ -249,12 +330,15 @@ func (sub *ScripthashSubscription) Resubscribe(ctx context.Context) error {
 }
 
 // SubscribeMasternode subscribes to receive notifications when a masternode status changes.
+// Cancel ctx when no longer reading. Cancellation or client shutdown closes the channel.
 // https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-headers-subscribe
 func (s *Client) SubscribeMasternode(ctx context.Context, collateral string) (<-chan string, error) {
+	notifications, unsubscribe := s.listenPush("blockchain.masternode.subscribe")
 	var resp basicResp
 
 	err := s.request(ctx, "blockchain.masternode.subscribe", []interface{}{collateral}, &resp)
 	if err != nil {
+		unsubscribe()
 		return nil, err
 	}
 
@@ -264,20 +348,31 @@ func (s *Client) SubscribeMasternode(ctx context.Context, collateral string) (<-
 	}
 
 	go func() {
-		for msg := range s.listenPush("blockchain.masternode.subscribe") {
-			if msg.err != nil {
+		defer close(respChan)
+		defer unsubscribe()
+		for {
+			select {
+			case <-ctx.Done():
 				return
-			}
-
-			var resp SubscribeNotif
-
-			err := json.Unmarshal(msg.content, &resp)
-			if err != nil {
+			case <-s.quit:
 				return
-			}
-
-			for _, param := range resp.Params {
-				respChan <- param
+			case msg, ok := <-notifications:
+				if !ok || msg.err != nil {
+					return
+				}
+				var resp SubscribeNotif
+				if err := json.Unmarshal(msg.content, &resp); err != nil {
+					return
+				}
+				for _, param := range resp.Params {
+					select {
+					case respChan <- param:
+					case <-ctx.Done():
+						return
+					case <-s.quit:
+						return
+					}
+				}
 			}
 		}
 	}()

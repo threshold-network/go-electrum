@@ -68,7 +68,8 @@ type Client struct {
 	Error chan error
 	quit  chan struct{}
 
-	nextID uint64
+	nextID       uint64
+	shutdownOnce sync.Once
 }
 
 // NewClient initializes a new client for remote server and connects to it using
@@ -104,7 +105,7 @@ func NewClientTCP(ctx context.Context, addr string) (*Client, error) {
 		handlers:     make(map[uint64]chan *container),
 		pushHandlers: make(map[string][]chan *container),
 
-		Error: make(chan error),
+		Error: make(chan error, 1),
 		quit:  make(chan struct{}),
 	}
 
@@ -125,7 +126,7 @@ func NewClientSSL(ctx context.Context, addr string, config *tls.Config) (*Client
 		handlers:     make(map[uint64]chan *container),
 		pushHandlers: make(map[string][]chan *container),
 
-		Error: make(chan error),
+		Error: make(chan error, 1),
 		quit:  make(chan struct{}),
 	}
 
@@ -147,7 +148,7 @@ func NewClientWebSocket(ctx context.Context, url string, config *tls.Config) (*C
 		handlers:     make(map[uint64]chan *container),
 		pushHandlers: make(map[string][]chan *container),
 
-		Error: make(chan error),
+		Error: make(chan error, 1),
 		quit:  make(chan struct{}),
 	}
 
@@ -214,10 +215,24 @@ func (s *Client) listen() {
 		select {
 		case <-s.quit:
 			return
-		case err := <-s.transport.Errors():
-			s.Error <- err
+		case err, ok := <-s.transport.Errors():
+			if ok {
+				s.reportError(err)
+			}
 			s.Shutdown()
-		case bytes := <-s.transport.Responses():
+			return
+		case bytes, ok := <-s.transport.Responses():
+			if !ok {
+				// Transports publish the terminal error before closing responses.
+				// Preserve it even when this select chooses the closed channel.
+				select {
+				case err := <-s.transport.Errors():
+					s.reportError(err)
+				default:
+				}
+				s.Shutdown()
+				return
+			}
 			result := &container{
 				content: bytes,
 			}
@@ -236,14 +251,13 @@ func (s *Client) listen() {
 			if len(msg.Method) > 0 {
 				s.pushHandlersLock.RLock()
 				handlers := s.pushHandlers[msg.Method]
-				s.pushHandlersLock.RUnlock()
-
 				for _, handler := range handlers {
 					select {
 					case handler <- result:
 					default:
 					}
 				}
+				s.pushHandlersLock.RUnlock()
 			}
 
 			s.handlersLock.RLock()
@@ -251,20 +265,52 @@ func (s *Client) listen() {
 			s.handlersLock.RUnlock()
 
 			if ok {
-				// TODO: very rare case. fix this memory leak, when nobody will read channel (in case of error)
-				c <- result
+				select {
+				case c <- result:
+				default:
+				}
 			}
 		}
 	}
 }
 
-func (s *Client) listenPush(method string) <-chan *container {
+func (s *Client) reportError(err error) {
+	if err != nil {
+		select {
+		case s.Error <- err:
+		default:
+		}
+	}
+}
+
+func (s *Client) listenPush(method string) (<-chan *container, func()) {
 	c := make(chan *container, 1)
 	s.pushHandlersLock.Lock()
+	defer s.pushHandlersLock.Unlock()
+	if s.IsShutdown() {
+		close(c)
+		return c, func() {}
+	}
 	s.pushHandlers[method] = append(s.pushHandlers[method], c)
-	s.pushHandlersLock.Unlock()
 
-	return c
+	return c, func() {
+		s.pushHandlersLock.Lock()
+		defer s.pushHandlersLock.Unlock()
+		handlers := s.pushHandlers[method]
+		for i, handler := range handlers {
+			if handler == c {
+				copy(handlers[i:], handlers[i+1:])
+				handlers[len(handlers)-1] = nil
+				handlers = handlers[:len(handlers)-1]
+				if len(handlers) == 0 {
+					delete(s.pushHandlers, method)
+				} else {
+					s.pushHandlers[method] = handlers
+				}
+				return
+			}
+		}
+	}
 }
 
 type request struct {
@@ -277,6 +323,8 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 	select {
 	case <-s.quit:
 		return ErrServerShutdown
+	case <-ctx.Done():
+		return ErrTimeout
 	default:
 	}
 
@@ -293,15 +341,13 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 
 	bytes = append(bytes, nl)
 
-	err = s.transport.SendMessage(bytes)
-	if err != nil {
-		s.Shutdown()
-		return err
-	}
-
 	c := make(chan *container, 1)
 
 	s.handlersLock.Lock()
+	if s.IsShutdown() {
+		s.handlersLock.Unlock()
+		return ErrServerShutdown
+	}
 	s.handlers[msg.ID] = c
 	s.handlersLock.Unlock()
 
@@ -311,11 +357,20 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 		s.handlersLock.Unlock()
 	}()
 
+	// Register before sending: a local or fast server can respond immediately.
+	err = s.transport.SendMessage(bytes)
+	if err != nil {
+		s.Shutdown()
+		return err
+	}
+
 	var resp *container
 	select {
 	case resp = <-c:
 	case <-ctx.Done():
 		return ErrTimeout
+	case <-s.quit:
+		return ErrServerShutdown
 	}
 
 	if resp.err != nil {
@@ -333,15 +388,19 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 }
 
 func (s *Client) Shutdown() {
-	if !s.IsShutdown() {
+	s.shutdownOnce.Do(func() {
 		close(s.quit)
-	}
-	if s.transport != nil {
-		_ = s.transport.Close()
-	}
-	s.transport = nil
-	s.handlers = nil
-	s.pushHandlers = nil
+		s.handlersLock.Lock()
+		s.handlers = nil
+		s.handlersLock.Unlock()
+		s.pushHandlersLock.Lock()
+		s.pushHandlers = nil
+		s.pushHandlersLock.Unlock()
+		// The transport pointer stays immutable while requests/listen use it.
+		if s.transport != nil {
+			_ = s.transport.Close()
+		}
+	})
 }
 
 func (s *Client) IsShutdown() bool {

@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"log"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -14,6 +15,10 @@ type TCPTransport struct {
 	conn      net.Conn
 	responses chan []byte
 	errors    chan error
+	quit      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // NewTCPTransport opens a new TCP connection to the remote server.
@@ -28,7 +33,9 @@ func NewTCPTransport(ctx context.Context, addr string) (*TCPTransport, error) {
 	tcp := &TCPTransport{
 		conn:      conn,
 		responses: make(chan []byte),
-		errors:    make(chan error),
+		errors:    make(chan error, 1),
+		quit:      make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 
 	go tcp.listen()
@@ -50,7 +57,9 @@ func NewSSLTransport(ctx context.Context, addr string, config *tls.Config) (*TCP
 	tcp := &TCPTransport{
 		conn:      conn,
 		responses: make(chan []byte),
-		errors:    make(chan error),
+		errors:    make(chan error, 1),
+		quit:      make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 
 	go tcp.listen()
@@ -59,20 +68,30 @@ func NewSSLTransport(ctx context.Context, addr string, config *tls.Config) (*TCP
 }
 
 func (t *TCPTransport) listen() {
+	defer close(t.done)
 	defer t.conn.Close()
+	defer close(t.responses)
+	defer close(t.errors)
 	reader := bufio.NewReader(t.conn)
 
 	for {
 		line, err := reader.ReadBytes(nl)
 		if err != nil {
-			t.errors <- err
+			select {
+			case t.errors <- err:
+			case <-t.quit:
+			}
 			break
 		}
 		if DebugMode {
 			log.Printf("%s [debug] %s -> %s", time.Now().Format("2006-01-02 15:04:05"), t.conn.RemoteAddr(), line)
 		}
 
-		t.responses <- line
+		select {
+		case t.responses <- line:
+		case <-t.quit:
+			return
+		}
 	}
 }
 
@@ -97,5 +116,9 @@ func (t *TCPTransport) Errors() <-chan error {
 }
 
 func (t *TCPTransport) Close() error {
-	return t.conn.Close()
+	t.closeOnce.Do(func() {
+		close(t.quit)
+		t.closeErr = t.conn.Close()
+	})
+	return t.closeErr
 }
