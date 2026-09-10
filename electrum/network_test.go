@@ -114,6 +114,23 @@ func awaitNoPushHandlers(t *testing.T, client *Client) {
 	}, testTimeout, time.Millisecond, "subscription did not unregister")
 }
 
+func awaitPushQueueEmpty(t *testing.T, client *Client, method string) {
+	t.Helper()
+	// A reply to this later RPC confirms that listen has dispatched the push.
+	// Only then can an empty queue prove that the subscription consumed it.
+	require.NoError(t, client.Ping(context.Background()))
+	require.Eventually(t, func() bool {
+		client.pushHandlersLock.RLock()
+		defer client.pushHandlersLock.RUnlock()
+		for _, handler := range client.pushHandlers[method] {
+			if len(handler) != 0 {
+				return false
+			}
+		}
+		return true
+	}, testTimeout, time.Millisecond, "subscription did not consume its queued push")
+}
+
 func push(t *testing.T, transport *stubTransport, body string) {
 	t.Helper()
 	select {

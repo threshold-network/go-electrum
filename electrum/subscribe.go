@@ -32,16 +32,21 @@ type SubscribeHeadersResult struct {
 // https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-headers-subscribe
 func (s *Client) SubscribeHeaders(ctx context.Context) (<-chan *SubscribeHeadersResult, error) {
 	notifications, unsubscribe := s.listenPush("blockchain.headers.subscribe")
-	var resp SubscribeHeadersResp
+	var snapshot SubscribeHeadersResp
 
-	err := s.request(ctx, "blockchain.headers.subscribe", []interface{}{}, &resp)
+	snapshotSequence, err := s.requestWithSequence(ctx, "blockchain.headers.subscribe", []interface{}{}, &snapshot)
 	if err != nil {
 		unsubscribe()
 		return nil, err
 	}
 
+	hasSnapshot := snapshot.Result != nil
+	var snapshotHeight int32
+	if hasSnapshot {
+		snapshotHeight = snapshot.Result.Height
+	}
 	respChan := make(chan *SubscribeHeadersResult, 1)
-	respChan <- resp.Result
+	respChan <- snapshot.Result
 
 	go func() {
 		defer close(respChan)
@@ -61,6 +66,12 @@ func (s *Client) SubscribeHeaders(ctx context.Context) (<-chan *SubscribeHeaders
 					return
 				}
 				for _, param := range resp.Params {
+					// Reconcile older queued headers with the initial snapshot.
+					// Later pushes may describe reorgs at the same or a lower
+					// height, so only filter messages received before the reply.
+					if msg.sequence < snapshotSequence && hasSnapshot && param != nil && param.Height <= snapshotHeight {
+						continue
+					}
 					select {
 					case respChan <- param:
 					case <-ctx.Done():

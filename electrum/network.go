@@ -51,8 +51,9 @@ type Transport interface {
 }
 
 type container struct {
-	content []byte
-	err     error
+	content  []byte
+	err      error
+	sequence uint64
 }
 
 // Client stores information about the remote server.
@@ -205,6 +206,7 @@ type response struct {
 }
 
 func (s *Client) listen() {
+	var sequence uint64
 	for {
 		if s.IsShutdown() {
 			break
@@ -233,8 +235,10 @@ func (s *Client) listen() {
 				s.Shutdown()
 				return
 			}
+			sequence++
 			result := &container{
-				content: bytes,
+				content:  bytes,
+				sequence: sequence,
 			}
 
 			msg := &response{}
@@ -320,11 +324,18 @@ type request struct {
 }
 
 func (s *Client) request(ctx context.Context, method string, params []interface{}, v interface{}) error {
+	_, err := s.requestWithSequence(ctx, method, params, v)
+	return err
+}
+
+// requestWithSequence also returns the response's position in the receive
+// stream, so subscriptions can distinguish earlier pushes from later updates.
+func (s *Client) requestWithSequence(ctx context.Context, method string, params []interface{}, v interface{}) (uint64, error) {
 	select {
 	case <-s.quit:
-		return ErrServerShutdown
+		return 0, ErrServerShutdown
 	case <-ctx.Done():
-		return ErrTimeout
+		return 0, ErrTimeout
 	default:
 	}
 
@@ -336,7 +347,7 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 
 	bytes, err := json.Marshal(msg)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	bytes = append(bytes, nl)
@@ -346,7 +357,7 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 	s.handlersLock.Lock()
 	if s.IsShutdown() {
 		s.handlersLock.Unlock()
-		return ErrServerShutdown
+		return 0, ErrServerShutdown
 	}
 	s.handlers[msg.ID] = c
 	s.handlersLock.Unlock()
@@ -361,36 +372,36 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 	err = s.transport.SendMessage(bytes)
 	if err != nil {
 		s.Shutdown()
-		return err
+		return 0, err
 	}
 
 	var resp *container
 	select {
 	case resp = <-c:
 	case <-ctx.Done():
-		return ErrTimeout
+		return 0, ErrTimeout
 	case <-s.quit:
 		// A reply can already be queued when the server disconnects. Preserve
 		// that completed request instead of randomly choosing the shutdown error.
 		select {
 		case resp = <-c:
 		default:
-			return ErrServerShutdown
+			return 0, ErrServerShutdown
 		}
 	}
 
 	if resp.err != nil {
-		return resp.err
+		return resp.sequence, resp.err
 	}
 
 	if v != nil {
 		err = json.Unmarshal(resp.content, v)
 		if err != nil {
-			return err
+			return resp.sequence, err
 		}
 	}
 
-	return nil
+	return resp.sequence, nil
 }
 
 func (s *Client) Shutdown() {

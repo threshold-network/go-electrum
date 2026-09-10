@@ -2,6 +2,7 @@ package electrum
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -27,6 +28,95 @@ func TestSubscribeHeadersDeliversInitialAndPushHeaders(t *testing.T) {
 	cancel()
 	awaitClosed(t, headers)
 	awaitNoPushHandlers(t, client)
+}
+
+func TestSubscribeHeadersReconcilesBufferedNotifications(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		before []string
+		after  string
+		want   *SubscribeHeadersResult
+	}{
+		{
+			name: "older_push_with_latest_push_dropped",
+			before: []string{
+				`[{"height":101,"hex":"older"}]`,
+				`[{"height":102,"hex":"snapshot"}]`,
+			},
+		},
+		{
+			name:   "duplicate_snapshot",
+			before: []string{`[{"height":102,"hex":"snapshot"}]`},
+		},
+		{
+			name:   "replaced_header_at_snapshot_height",
+			before: []string{`[{"height":102,"hex":"old-branch"}]`},
+		},
+		{
+			name:   "newer_header_in_buffered_batch",
+			before: []string{`[{"height":101,"hex":"older"},{"height":102,"hex":"snapshot"},{"height":103,"hex":"newer"}]`},
+			want:   &SubscribeHeadersResult{Height: 103, Hex: "newer"},
+		},
+		{
+			name:  "lower_reorg_after_snapshot",
+			after: `[{"height":101,"hex":"reorg"}]`,
+			want:  &SubscribeHeadersResult{Height: 101, Hex: "reorg"},
+		},
+		{
+			name:  "same_height_reorg_after_snapshot",
+			after: `[{"height":102,"hex":"reorg"}]`,
+			want:  &SubscribeHeadersResult{Height: 102, Hex: "reorg"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, transport := newTestClient(t)
+			// Single leaves a subscription on the server, so pushes can arrive
+			// while the streaming subscription asks for its initial snapshot.
+			_, err := client.SubscribeHeadersSingle(context.Background())
+			require.NoError(t, err)
+			send := transport.send
+			transport.send = func(message []byte) error {
+				var req request
+				if err := json.Unmarshal(message, &req); err != nil {
+					return err
+				}
+				if req.Method != "blockchain.headers.subscribe" {
+					return send(message)
+				}
+				for _, params := range test.before {
+					push(t, transport, `{"method":"blockchain.headers.subscribe","params":`+params+`}`)
+				}
+				response, err := json.Marshal(struct {
+					ID     uint64                 `json:"id"`
+					Result SubscribeHeadersResult `json:"result"`
+				}{req.ID, SubscribeHeadersResult{Height: 102, Hex: "snapshot"}})
+				if err != nil {
+					return err
+				}
+				push(t, transport, string(response))
+				if test.after != "" {
+					// Deliver this after the response but before SubscribeHeaders
+					// can resume and start its forwarding goroutine.
+					push(t, transport, `{"method":"blockchain.headers.subscribe","params":`+test.after+`}`)
+				}
+				return nil
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			headers, err := client.SubscribeHeaders(ctx)
+			require.NoError(t, err)
+			require.Equal(t, &SubscribeHeadersResult{Height: 102, Hex: "snapshot"}, receive(t, headers))
+			if test.want != nil {
+				require.Equal(t, test.want, receive(t, headers))
+			}
+			awaitPushQueueEmpty(t, client, "blockchain.headers.subscribe")
+			push(t, transport, `{"method":"blockchain.headers.subscribe","params":[{"height":104,"hex":"live"}]}`)
+			require.Equal(t, &SubscribeHeadersResult{Height: 104, Hex: "live"}, receive(t, headers), "replayed a header superseded by the snapshot")
+			cancel()
+			awaitClosed(t, headers)
+			awaitNoPushHandlers(t, client)
+		})
+	}
 }
 
 func TestSubscribeHeadersStopsWithoutReader(t *testing.T) {
@@ -136,6 +226,7 @@ func TestSubscribeScripthashDeliversAndFilters(t *testing.T) {
 	require.NoError(t, sub.Add(context.Background(), "script", "address"))
 	require.Equal(t, [2]string{"script", "initial"}, receive(t, notifications).Params)
 	push(t, transport, `{"method":"blockchain.scripthash.subscribe","params":["other","ignored"]}`)
+	awaitPushQueueEmpty(t, client, "blockchain.scripthash.subscribe")
 	push(t, transport, `{"method":"blockchain.scripthash.subscribe","params":["script","updated"]}`)
 	require.Equal(t, [2]string{"script", "updated"}, receive(t, notifications).Params)
 	address, err := sub.GetAddress("script")
