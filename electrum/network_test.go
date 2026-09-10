@@ -208,6 +208,43 @@ func TestShutdownUnblocksPendingRequest(t *testing.T) {
 	require.ErrorIs(t, receive(t, result), ErrServerShutdown)
 }
 
+func TestRequestPreservesQueuedResponseOnShutdown(t *testing.T) {
+	for _, responseError := range []error{nil, &apiErr{Code: -1, Message: "rejected"}} {
+		name := "success"
+		if responseError != nil {
+			name = "rpc_error"
+		}
+		t.Run(name, func(t *testing.T) {
+			for i := 0; i < 100; i++ {
+				client, transport := newTestClient(t)
+				transport.send = func(message []byte) error {
+					var req request
+					if err := json.Unmarshal(message, &req); err != nil {
+						return err
+					}
+					client.handlersLock.RLock()
+					handler := client.handlers[req.ID]
+					client.handlersLock.RUnlock()
+					// Queue the complete reply and shut down before request can
+					// resume, so both select cases are ready on every iteration.
+					handler <- &container{
+						content: []byte(`{"result":"accepted"}`),
+						err:     responseError,
+					}
+					client.Shutdown()
+					return nil
+				}
+				var response basicResp
+				err := client.request(context.Background(), "test", nil, &response)
+				require.ErrorIs(t, err, responseError)
+				if responseError == nil {
+					require.Equal(t, "accepted", response.Result)
+				}
+			}
+		})
+	}
+}
+
 func TestTransportErrorShutsDownWithoutErrorReader(t *testing.T) {
 	client, transport := newTestClient(t)
 	_, notifications := client.SubscribeScripthash()

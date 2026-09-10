@@ -370,7 +370,13 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 	case <-ctx.Done():
 		return ErrTimeout
 	case <-s.quit:
-		return ErrServerShutdown
+		// A reply can already be queued when the server disconnects. Preserve
+		// that completed request instead of randomly choosing the shutdown error.
+		select {
+		case resp = <-c:
+		default:
+			return ErrServerShutdown
+		}
 	}
 
 	if resp.err != nil {

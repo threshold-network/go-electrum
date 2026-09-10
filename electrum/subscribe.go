@@ -221,22 +221,48 @@ func (sub *ScripthashSubscription) Add(ctx context.Context, scripthash string, a
 	if err := sub.ctx.Err(); err != nil {
 		return err
 	}
+	// End the RPC when either the caller or the subscription cancels. Join the
+	// cancellation watcher on every return path so it cannot outlive this Add.
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-sub.ctx.Done():
+			cancelRequest()
+		case <-requestCtx.Done():
+		}
+	}()
+	defer func() {
+		cancelRequest()
+		<-watcherDone
+	}()
 	var resp basicResp
 
-	err := sub.server.request(ctx, "blockchain.scripthash.subscribe", []interface{}{scripthash}, &resp)
+	err := sub.server.request(requestCtx, "blockchain.scripthash.subscribe", []interface{}{scripthash}, &resp)
 	if err != nil {
+		if err == ErrTimeout && sub.ctx.Err() != nil {
+			return sub.ctx.Err()
+		}
 		return err
 	}
 
+	// Publish the initial status before the push worker can observe this script
+	// as active. Never hold the subscription state lock while waiting on a reader.
+	if len(resp.Result) > 0 {
+		if err := sub.notify(ctx, &SubscribeNotif{[2]string{scripthash, resp.Result}}); err != nil {
+			return err
+		}
+	}
+
 	sub.lock.Lock()
+	defer sub.lock.Unlock()
+	if err := sub.ctx.Err(); err != nil {
+		return err
+	}
 	sub.subscribedSH = append(sub.subscribedSH[:], scripthash)
 	if len(address) > 0 {
 		sub.scripthashMap[scripthash] = address[0]
-	}
-	sub.lock.Unlock()
-
-	if len(resp.Result) > 0 {
-		return sub.notify(ctx, &SubscribeNotif{[2]string{scripthash, resp.Result}})
 	}
 
 	return nil

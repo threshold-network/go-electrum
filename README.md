@@ -69,6 +69,9 @@ Canceling a subscription also removes its local notification handler.
 its returned subscription to stop it without shutting down the client. Use
 `SubscribeHeadersSingle` when only the current blockchain tip is needed.
 
+Closing or canceling a scripthash subscription also cancels its pending `Add`
+requests. Canceling an individual `Add` request leaves the subscription active.
+
 Cancellation stops local delivery; the Electrum protocol does not cancel the
 server's header subscription. Slow readers retain the existing bounded buffering
 behavior, so notifications may be dropped when a subscription's buffer is full.
