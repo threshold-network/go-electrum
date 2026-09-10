@@ -15,11 +15,15 @@ func TestSubscribeHeadersDeliversInitialAndPushHeaders(t *testing.T) {
 	client, transport := newTestClient(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// A server may push a notification before returning the initial response.
+	// A push can follow the response before SubscribeHeaders resumes and starts
+	// forwarding. Registration must already be in place to retain that update.
 	send := transport.send
 	transport.send = func(message []byte) error {
+		if err := send(message); err != nil {
+			return err
+		}
 		push(t, transport, `{"method":"blockchain.headers.subscribe","params":[{"height":101,"hex":"next"}]}`)
-		return send(message)
+		return nil
 	}
 	headers, err := client.SubscribeHeaders(ctx)
 	require.NoError(t, err)
@@ -53,9 +57,17 @@ func TestSubscribeHeadersReconcilesBufferedNotifications(t *testing.T) {
 			before: []string{`[{"height":102,"hex":"old-branch"}]`},
 		},
 		{
-			name:   "newer_header_in_buffered_batch",
-			before: []string{`[{"height":101,"hex":"older"},{"height":102,"hex":"snapshot"},{"height":103,"hex":"newer"}]`},
-			want:   &SubscribeHeadersResult{Height: 103, Hex: "newer"},
+			name:   "higher_orphan_before_lower_snapshot",
+			before: []string{`[{"height":103,"hex":"orphan"}]`},
+		},
+		{
+			name:   "higher_orphan_in_buffered_batch",
+			before: []string{`[{"height":101,"hex":"older"},{"height":102,"hex":"snapshot"},{"height":103,"hex":"orphan"}]`},
+		},
+		{
+			name:  "higher_header_after_snapshot",
+			after: `[{"height":103,"hex":"newer"}]`,
+			want:  &SubscribeHeadersResult{Height: 103, Hex: "newer"},
 		},
 		{
 			name:  "lower_reorg_after_snapshot",
@@ -197,6 +209,76 @@ func TestSubscribeMasternodeDeliversAndStops(t *testing.T) {
 	cancel()
 	awaitClosed(t, notifications)
 	awaitNoPushHandlers(t, client)
+}
+
+func TestSubscribeMasternodeReconcilesBufferedNotifications(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		before string
+		after  string
+	}{
+		{name: "superseded_status", before: "EXPIRED"},
+		{name: "duplicate_status", before: "ENABLED"},
+		{name: "update_after_response", after: "EXPIRED"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, transport := newTestClient(t)
+			// Canceling local delivery leaves the collateral subscribed on the
+			// server, which can push a status while a new stream is starting.
+			previousCtx, cancelPrevious := context.WithCancel(context.Background())
+			defer cancelPrevious()
+			previous, err := client.SubscribeMasternode(previousCtx, "collateral")
+			require.NoError(t, err)
+			require.Equal(t, "initial", receive(t, previous))
+			cancelPrevious()
+			awaitClosed(t, previous)
+			awaitNoPushHandlers(t, client)
+
+			send := transport.send
+			transport.send = func(message []byte) error {
+				var req request
+				if err := json.Unmarshal(message, &req); err != nil {
+					return err
+				}
+				if req.Method != "blockchain.masternode.subscribe" {
+					return send(message)
+				}
+				if test.before != "" {
+					push(t, transport, `{"method":"blockchain.masternode.subscribe","params":["collateral","`+test.before+`"]}`)
+				}
+				response, err := json.Marshal(struct {
+					ID     uint64 `json:"id"`
+					Result string `json:"result"`
+				}{req.ID, "ENABLED"})
+				if err != nil {
+					return err
+				}
+				push(t, transport, string(response))
+				if test.after != "" {
+					// Queue an update after the response before the forwarding
+					// goroutine can start. The sequence cutoff must preserve it.
+					push(t, transport, `{"method":"blockchain.masternode.subscribe","params":["collateral","`+test.after+`"]}`)
+				}
+				return nil
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			notifications, err := client.SubscribeMasternode(ctx, "collateral")
+			require.NoError(t, err)
+			require.Equal(t, "ENABLED", receive(t, notifications))
+			if test.after != "" {
+				require.Equal(t, "collateral", receive(t, notifications))
+				require.Equal(t, test.after, receive(t, notifications))
+			}
+			awaitPushQueueEmpty(t, client, "blockchain.masternode.subscribe")
+			push(t, transport, `{"method":"blockchain.masternode.subscribe","params":["collateral","LIVE"]}`)
+			require.Equal(t, "collateral", receive(t, notifications))
+			require.Equal(t, "LIVE", receive(t, notifications), "replayed a status superseded by the initial response")
+			cancel()
+			awaitClosed(t, notifications)
+			awaitNoPushHandlers(t, client)
+		})
+	}
 }
 
 func TestSubscribeMasternodeStopsWithoutReader(t *testing.T) {

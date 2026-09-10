@@ -40,11 +40,6 @@ func (s *Client) SubscribeHeaders(ctx context.Context) (<-chan *SubscribeHeaders
 		return nil, err
 	}
 
-	hasSnapshot := snapshot.Result != nil
-	var snapshotHeight int32
-	if hasSnapshot {
-		snapshotHeight = snapshot.Result.Height
-	}
 	respChan := make(chan *SubscribeHeadersResult, 1)
 	respChan <- snapshot.Result
 
@@ -65,13 +60,13 @@ func (s *Client) SubscribeHeaders(ctx context.Context) (<-chan *SubscribeHeaders
 				if err := json.Unmarshal(msg.content, &resp); err != nil {
 					return
 				}
+				// The snapshot supersedes all earlier pushes. A higher queued
+				// header can be an orphan after a reorganization, so height
+				// cannot determine whether it is newer than the snapshot.
+				if msg.sequence < snapshotSequence {
+					continue
+				}
 				for _, param := range resp.Params {
-					// Reconcile older queued headers with the initial snapshot.
-					// Later pushes may describe reorgs at the same or a lower
-					// height, so only filter messages received before the reply.
-					if msg.sequence < snapshotSequence && hasSnapshot && param != nil && param.Height <= snapshotHeight {
-						continue
-					}
 					select {
 					case respChan <- param:
 					case <-ctx.Done():
@@ -373,7 +368,7 @@ func (s *Client) SubscribeMasternode(ctx context.Context, collateral string) (<-
 	notifications, unsubscribe := s.listenPush("blockchain.masternode.subscribe")
 	var resp basicResp
 
-	err := s.request(ctx, "blockchain.masternode.subscribe", []interface{}{collateral}, &resp)
+	snapshotSequence, err := s.requestWithSequence(ctx, "blockchain.masternode.subscribe", []interface{}{collateral}, &resp)
 	if err != nil {
 		unsubscribe()
 		return nil, err
@@ -400,6 +395,10 @@ func (s *Client) SubscribeMasternode(ctx context.Context, collateral string) (<-
 				var resp SubscribeNotif
 				if err := json.Unmarshal(msg.content, &resp); err != nil {
 					return
+				}
+				// The initial status supersedes pushes received before the reply.
+				if msg.sequence < snapshotSequence {
+					continue
 				}
 				for _, param := range resp.Params {
 					select {
