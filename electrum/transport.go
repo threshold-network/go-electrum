@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"log"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -14,6 +15,10 @@ type TCPTransport struct {
 	conn      net.Conn
 	responses chan []byte
 	errors    chan error
+	// done is closed by Close, so listen never blocks on a send nobody
+	// reads after the client stopped.
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewTCPTransport opens a new TCP connection to the remote server.
@@ -29,6 +34,7 @@ func NewTCPTransport(ctx context.Context, addr string) (*TCPTransport, error) {
 		conn:      conn,
 		responses: make(chan []byte),
 		errors:    make(chan error),
+		done:      make(chan struct{}),
 	}
 
 	go tcp.listen()
@@ -51,6 +57,7 @@ func NewSSLTransport(ctx context.Context, addr string, config *tls.Config) (*TCP
 		conn:      conn,
 		responses: make(chan []byte),
 		errors:    make(chan error),
+		done:      make(chan struct{}),
 	}
 
 	go tcp.listen()
@@ -65,14 +72,21 @@ func (t *TCPTransport) listen() {
 	for {
 		line, err := reader.ReadBytes(nl)
 		if err != nil {
-			t.errors <- err
-			break
+			select {
+			case t.errors <- err:
+			case <-t.done:
+			}
+			return
 		}
 		if DebugMode {
 			log.Printf("%s [debug] %s -> %s", time.Now().Format("2006-01-02 15:04:05"), t.conn.RemoteAddr(), line)
 		}
 
-		t.responses <- line
+		select {
+		case t.responses <- line:
+		case <-t.done:
+			return
+		}
 	}
 }
 
@@ -97,5 +111,6 @@ func (t *TCPTransport) Errors() <-chan error {
 }
 
 func (t *TCPTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.done) })
 	return t.conn.Close()
 }

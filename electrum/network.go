@@ -65,8 +65,12 @@ type Client struct {
 	pushHandlers     map[string][]chan *container
 	pushHandlersLock sync.RWMutex
 
+	// Error receives transport errors. Sends never block: an error nobody
+	// reads is dropped.
 	Error chan error
 	quit  chan struct{}
+
+	shutdownOnce sync.Once
 
 	nextID uint64
 }
@@ -205,18 +209,16 @@ type response struct {
 
 func (s *Client) listen() {
 	for {
-		if s.IsShutdown() {
-			break
-		}
-		if s.transport == nil {
-			break
-		}
 		select {
 		case <-s.quit:
 			return
 		case err := <-s.transport.Errors():
-			s.Error <- err
+			select {
+			case s.Error <- err:
+			default:
+			}
 			s.Shutdown()
+			return
 		case bytes := <-s.transport.Responses():
 			result := &container{
 				content: bytes,
@@ -251,8 +253,12 @@ func (s *Client) listen() {
 			s.handlersLock.RUnlock()
 
 			if ok {
-				// TODO: very rare case. fix this memory leak, when nobody will read channel (in case of error)
-				c <- result
+				// The channel has room for one reply and request reads at
+				// most one, so a duplicate reply must not block listen.
+				select {
+				case c <- result:
+				default:
+				}
 			}
 		}
 	}
@@ -332,16 +338,15 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 	return nil
 }
 
+// Shutdown closes the connection and stops the client's goroutines. It is
+// safe to call more than once and concurrently with requests. The transport
+// field is never cleared, so a request racing with Shutdown fails with a
+// send error instead of a nil dereference.
 func (s *Client) Shutdown() {
-	if !s.IsShutdown() {
+	s.shutdownOnce.Do(func() {
 		close(s.quit)
-	}
-	if s.transport != nil {
 		_ = s.transport.Close()
-	}
-	s.transport = nil
-	s.handlers = nil
-	s.pushHandlers = nil
+	})
 }
 
 func (s *Client) IsShutdown() bool {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -15,6 +16,10 @@ type WebSocketTransport struct {
 	errors    chan error
 	// close is a channel used for graceful connection closure
 	close chan struct{}
+	// done is closed by Close, so listen never blocks on a send nobody
+	// reads after the client stopped.
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 const webSocketClosingTimeout = 2 * time.Second
@@ -47,6 +52,7 @@ func NewWebSocketTransport(
 		responses: make(chan []byte),
 		errors:    make(chan error),
 		close:     make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 
 	go ws.listen()
@@ -72,13 +78,20 @@ func (t *WebSocketTransport) listen() {
 		if err != nil {
 			isNormalClose := websocket.IsCloseError(err, websocket.CloseNormalClosure)
 			if !isNormalClose {
-				t.errors <- err
+				select {
+				case t.errors <- err:
+				case <-t.done:
+				}
 			}
 
-			break
+			return
 		}
 
-		t.responses <- msg
+		select {
+		case t.responses <- msg:
+		case <-t.done:
+			return
+		}
 	}
 }
 
@@ -103,6 +116,8 @@ func (t *WebSocketTransport) Errors() <-chan error {
 
 // Close closes WebSocket transport.
 func (t *WebSocketTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.done) })
+
 	// Cleanly close the connection by sending a close message and then
 	// waiting (with timeout) for the server to close the connection.
 	err := t.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
