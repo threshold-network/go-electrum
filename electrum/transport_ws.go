@@ -20,6 +20,9 @@ type WebSocketTransport struct {
 	// reads after the client stopped.
 	done      chan struct{}
 	closeOnce sync.Once
+	// writeMutex serializes writes to conn. The gorilla/websocket package
+	// supports only one concurrent writer, so every write must hold it.
+	writeMutex sync.Mutex
 }
 
 const webSocketClosingTimeout = 2 * time.Second
@@ -101,6 +104,9 @@ func (t *WebSocketTransport) SendMessage(body []byte) error {
 		log.Printf("%s [debug] %s <- %s", time.Now().Format("2006-01-02 15:04:05"), t.conn.RemoteAddr(), body)
 	}
 
+	t.writeMutex.Lock()
+	defer t.writeMutex.Unlock()
+
 	return t.conn.WriteMessage(websocket.TextMessage, body)
 }
 
@@ -120,7 +126,9 @@ func (t *WebSocketTransport) Close() error {
 
 	// Cleanly close the connection by sending a close message and then
 	// waiting (with timeout) for the server to close the connection.
+	t.writeMutex.Lock()
 	err := t.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	t.writeMutex.Unlock()
 	if err != nil {
 		log.Printf("%s [error] %s -> close error: %s", time.Now().Format("2006-01-02 15:04:05"), t.conn.RemoteAddr(), err)
 	}
